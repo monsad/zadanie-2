@@ -1,0 +1,95 @@
+groups:
+  - name: webhook
+    rules:
+      - alert: WebhookBacklogStale
+        expr: webhooks_dispatch_lag_seconds > 60
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: Runnable webhooks wait more than 60 s for a worker
+          description: >-
+            Healthy lag is under 10 s. Check workers_busy (saturated pool:
+            raise WORKER_CONCURRENCY) and workers_alive (dispatcher died:
+            restart, read logs for claim.failed).
+
+      - alert: WebhookQueueGrowing
+        expr: deriv(webhooks_queue_depth{status="pending"}[5m]) > 0
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: Pending queue keeps growing
+          description: Arrival rate exceeds processing rate; see dispatch lag.
+
+      - alert: WebhookDeadLetters
+        expr: increase(webhooks_processed_total{result="dead"}[15m]) > 0
+        labels: {severity: critical}
+        annotations:
+          summary: Webhooks exhausted all attempts
+          description: >-
+            GET /webhooks?status=dead (admin token), read last_error, fix the
+            cause, then POST /webhooks/{key}/replay.
+
+      - alert: WebhookFailureRateHigh
+        expr: >-
+          sum(rate(webhooks_processed_total{result="retry_scheduled"}[5m]))
+          / clamp_min(sum(rate(webhooks_processed_total[5m])), 1e-9) > 0.05
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: More than 5 % of attempts fail
+          description: Group logs webhook.retry_scheduled by event_type.
+
+      - alert: WebhookLeaseRecoveries
+        expr: increase(webhook_lease_recovered_total[10m]) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: Leases were taken back from dead or stalled workers
+          description: >-
+            reason=startup means a crash/restart; reason=expired means work
+            exceeded LEASE_SECONDS.
+
+      - alert: WebhookStaleWrites
+        expr: increase(webhook_lease_stale_total[10m]) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: Fencing rejected writes from a worker that lost its lease
+          description: Processing is slower than the lease; raise LEASE_SECONDS.
+
+      - alert: WebhookWorkersDown
+        expr: workers_alive < 1
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: Dispatcher is not running
+          description: Accepted webhooks are not processed; /ready returns 503.
+
+      - alert: WebhookBackpressure
+        expr: sum(rate(webhooks_received_total{outcome="rejected"}[5m])) > 0
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: Queue is full, new webhooks get 503
+          description: Senders retry; scale processing or raise MAX_QUEUE_DEPTH.
+
+      - alert: WebhookUnauthorizedSpike
+        expr: sum(rate(webhooks_received_total{outcome="unauthorized"}[5m])) > 1
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: Many requests with invalid signatures
+          description: A sender rotated secrets or someone probes the endpoint.
+
+      - alert: WebhookTargetDown
+        expr: up{job="webhook"} == 0
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: Prometheus cannot scrape the service
+
+      - alert: WebhookDiskLow
+        expr: webhook_db_disk_free_ratio < 0.2
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: Less than 20 % disk left for the database and WAL
+          description: Check retention ran (webhook_retention_purged_total).

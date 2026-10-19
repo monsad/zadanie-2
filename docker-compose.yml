@@ -1,0 +1,38 @@
+services:
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - webhook-data:/data
+    environment:
+      LOG_LEVEL: INFO
+      # Uncomment to require HMAC signatures and enable admin endpoints:
+      # WEBHOOK_SECRETS: "shop:change-me,crm:change-me-too"
+      # ADMIN_TOKEN: "change-me"
+    stop_grace_period: 20s
+
+  prometheus:
+    image: prom/prometheus:v3.7.3
+    profiles: [monitoring]
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
+
+  grafana:
+    image: grafana/grafana:12.2.1
+    profiles: [monitoring]
+    ports:
+      - "3000:3000"
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+
+volumes:
+  webhook-data:
