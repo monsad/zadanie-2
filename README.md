@@ -4,6 +4,12 @@ HTTP API, które przyjmuje webhooki JSON, zapisuje je trwale w SQLite przed
 potwierdzeniem, przetwarza asynchronicznie i udostępnia status każdego
 zdarzenia. Python 3.15, FastAPI, aiosqlite.
 
+**Spis treści:** [Zakres](#zakres) · [Uruchomienie](#uruchomienie) ·
+[API](#api) · [Architektura](#architektura) ·
+[Jak spełnione są wymagania](#jak-spełnione-są-wymagania) ·
+[Tradeoffs](#tradeoffs) · [Benchmark](#benchmark) ·
+[Konfiguracja](#konfiguracja) · [Harness](#harness) · [TODO](#todo)
+
 ## Zakres
 
 - **Rdzeń zadania:** zapis do SQLite przed odpowiedzią 202, idempotency po
@@ -57,11 +63,13 @@ curl localhost:8000/webhooks/evt-001   # po 2–5 s: "status": "completed"
 
 | Metoda | Endpoint | Odpowiedzi |
 |---|---|---|
-| POST | `/webhooks` | 202 nowe, 200 duplikat, 409 konflikt, 401 zły podpis, 413 za duże, 422 niepoprawne, 429 limit, 503 kolejka pełna / baza niedostępna |
-| GET | `/webhooks/{key}` | 200 status, 404 |
-| GET | `/webhooks?status=&limit=&after=` | lista dla operatora (`X-Admin-Token`) |
-| POST | `/webhooks/{key}/replay` | `dead` → `pending` (`X-Admin-Token`) |
-| GET | `/health`, `/ready`, `/metrics` | liveness, readiness, Prometheus |
+| POST | `/webhooks` | 202 nowe, 200 duplikat, 409 konflikt, 401 zły podpis, 413 za duże, 422 niepoprawne, 429 limit, 503 kolejka pełna / baza niedostępna / shutdown |
+| GET | `/webhooks/{key}` | 200 status, 401 zły podpis, 404 nieznany, 422 zły format klucza, 503 baza niedostępna |
+| GET | `/webhooks?status=&limit=&after=` | lista dla operatora (`X-Admin-Token`): 200, 401, 422, 503 |
+| POST | `/webhooks/{key}/replay` | `dead` → `pending` (`X-Admin-Token`): 202, 401, 404, 409 nie `dead`, 503 |
+| GET | `/health` | 200, gdy proces odpowiada |
+| GET | `/ready` | 200 gotowy, 503 baza / dispatcher niedostępne albo shutdown |
+| GET | `/metrics` | 200, format Prometheusa |
 
 Status zawiera `status`, `attempts`, czasy, `last_error` i `result`. Payload
 nie wraca w statusie i nie trafia do logów (dane osobowe).
@@ -124,8 +132,10 @@ ma osobnego brokera.
 | `main.py` | składa wszystko razem |
 
 Zależności wskazują do `domain.py`; test statyczny pilnuje, że domena nie
-importuje FastAPI, aiosqlite ani asyncio. Zamiana SQLite na Postgresa dotyka
-tylko `repository.py`.
+importuje FastAPI, aiosqlite ani asyncio. Przy zamianie SQLite na Postgresa
+reguły domenowe zostają bez zmian; większość pracy to `repository.py`,
+schemat i warstwa infrastruktury (zależności, konfiguracja, Compose, część
+testów).
 
 Flow biznesowy zdarzenia (statusy) jest w sekcji
 [Model danych](#model-danych).
@@ -164,7 +174,7 @@ Flow biznesowy zdarzenia (statusy) jest w sekcji
 
 | Etap | Gwarancja |
 |---|---|
-| Przyjęcie | dokładnie raz |
+| Utworzenie zadania | najwyżej raz dla danego `idempotency_key` w okresie życia klucza (90 dni); odpowiedź 202 może zginąć po `COMMIT`, wtedy ponowienie dostaje 200 |
 | Wykonanie handlera | co najmniej raz: crash w trakcie oznacza ponowienie |
 | Zapis wyniku | dokładnie raz (fencing) |
 | Kolejność | brak: `order.paid` może wyprzedzić `order.created` |
@@ -175,7 +185,8 @@ Efekty uboczne poza SQLite (np. e-mail) wymagałyby idempotencji po
 
 ### Przetwarzanie async
 
-- Przyjęcie to jeden `INSERT` i `notify()`; przetwarzanie dzieje się w
+- Przyjęcie to jedna krótka transakcja (sprawdzenie klucza, limitu kolejki,
+  zapis zdarzenia i klucza) i `notify()`; przetwarzanie dzieje się w
   dispatcherze, niezależnie od requestu.
 - **Jeden claimer zamiast 64 pollujących workerów:** jedno zapytanie na
   wybudzenie i dokładny limit współbieżności.
@@ -217,9 +228,11 @@ typowe okno retry nadawców), `dead` 30 dni (czas na analizę i replay), klucze
 - **Metryki:** ruch per wynik (przyjęte, duplikaty, 401/429/503), wyniki
   przetwarzania, głębokość kolejki, czasy (przyjęcie, przetwarzanie, end to
   end), odzyskane i odrzucone dzierżawy, zajęte sloty, wolne miejsce na dysku.
-- **Logi:** JSON, jedna linia na zdarzenie (`webhook.received`,
-  `webhook.completed`, `webhook.dead`, `lease.recovered`...). Każda linia
-  workera ma `idempotency_key`, więc `grep evt-001` pokazuje całą historię.
+- **Logi:** JSON, osobna linia na każdy etap życia zdarzenia
+  (`webhook.received`, `webhook.claimed`, `webhook.completed`,
+  `webhook.retry_scheduled`, `webhook.dead`, `lease.recovered`...). Każda
+  linia dotycząca zdarzenia ma `idempotency_key`, więc `grep evt-001`
+  pokazuje całą jego historię.
 - **Health vs ready:** `/health` nie dotyka bazy, więc orkiestrator nie
   restartuje serwisu przy chwilowej blokadzie; `/ready` sprawdza bazę i
   dispatcher.
@@ -267,20 +280,27 @@ all terminal after 66.4s; unfinished=0
 
 ## Konfiguracja
 
-Zmienne środowiskowe, walidowane przy starcie (`app/config.py`):
+Wszystkie zmienne środowiskowe, walidowane przy starcie (`app/config.py`):
 
 | Zmienna | Domyślnie | |
 |---|---|---|
-| `DB_PATH` | `/data/webhooks.db` | |
+| `DB_PATH` | `/data/webhooks.db` | plik bazy |
 | `WORKER_CONCURRENCY` | 64 | sloty przetwarzania |
 | `LEASE_SECONDS` | 30 | musi być ≥ 3 × `PROCESSING_MAX` |
+| `POLL_INTERVAL` | 0,5 | s; najdłuższe czekanie dispatchera na pracę |
+| `RECOVERY_INTERVAL`, `STATS_INTERVAL` | 10, 1 | s; odzyskiwanie dzierżaw, odświeżanie metryk kolejki |
 | `MAX_ATTEMPTS`, `BACKOFF_BASE`, `BACKOFF_MAX` | 5, 2, 300 | retry |
 | `MAX_QUEUE_DEPTH` | 10000 | backpressure |
+| `MAX_BODY_BYTES` | 262144 | limit body (413) |
 | `RATE_LIMIT_RPS`, `RATE_LIMIT_BURST` | 50, 100 | per źródło |
-| `WEBHOOK_SECRETS`, `ADMIN_TOKEN` | puste | HMAC, endpointy admina |
+| `ALLOWED_SOURCES` | puste | znane źródła; reszta trafia do jednego kubełka `other` |
+| `WEBHOOK_SECRETS`, `SIGNATURE_TOLERANCE` | puste, 300 | HMAC (`zrodlo:sekret,...`), okno znacznika czasu w s |
+| `ADMIN_TOKEN` | puste | puste = endpointy admina zawsze 401 |
 | `RETENTION_COMPLETED_DAYS`, `RETENTION_DEAD_DAYS`, `RETENTION_IDEMPOTENCY_DAYS` | 7, 30, 90 | retencja |
+| `RETENTION_INTERVAL` | 3600 | s; jak często działa retencja |
 | `PROCESSING_MIN`, `PROCESSING_MAX`, `FAILURE_RATE` | 2, 5, 0 | symulacja; `event_type=test.poison` zawsze się wywraca |
 | `SHUTDOWN_GRACE` | 10 | sekundy na dokończenie pracy przy SIGTERM |
+| `LOG_LEVEL` | `INFO` | |
 
 ## Harness
 
